@@ -1,0 +1,42 @@
+{
+  "name": "mcp-signal",
+  "version": "0.1.0",
+  "description": "Trust scoring and security layer for MCP servers",
+  "license": "MIT",
+  "author": "Incultnito LLC",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-signal": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "security",
+    "trust",
+    "scoring"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chalk": "^5.6.2",
+    "commander": "^15.0.0",
+    "ora": "^9.4.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.4"
+  }
+}
