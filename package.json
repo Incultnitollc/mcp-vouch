@@ -7,7 +7,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "mcp-vouch": "./dist/index.js"
+    "mcp-vouch": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",

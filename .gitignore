@@ -3,3 +3,7 @@ dist/
 .env
 .env.local
 *.log
+
+# Private planning docs — never publish
+PHASE-2-PLAN.md
+*.local.md
