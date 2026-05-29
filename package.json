@@ -1,5 +1,5 @@
 {
-  "name": "mcp-signal",
+  "name": "mcp-vouch",
   "version": "0.1.0",
   "description": "Trust scoring and security layer for MCP servers",
   "license": "MIT",
@@ -7,7 +7,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "mcp-signal": "./dist/index.js"
+    "mcp-vouch": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -19,7 +19,9 @@
     "model-context-protocol",
     "security",
     "trust",
-    "scoring"
+    "scoring",
+    "vouch",
+    "owasp"
   ],
   "files": [
     "dist",
