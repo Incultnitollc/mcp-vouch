@@ -42,11 +42,18 @@ export function repoNameGuess(sourceUrl: string): string | null {
   return m[1]!.replace(/\.git$/i, "").toLowerCase();
 }
 
+/**
+ * True only if the package has at least one published version on npm.
+ * Hits `/<pkg>/latest` — 200 means a usable tag exists; 404 covers both
+ * "package not found" and "package exists but never published a version"
+ * (the ENOVERSIONS case that crashes `npx -y <pkg>` at runtime).
+ */
 export async function npmRegistryExists(pkg: string): Promise<boolean> {
   try {
-    const res = await fetch(`${NPM_REGISTRY}/${pkg.replace("/", "%2F")}`, {
-      method: "GET",
-    });
+    const res = await fetch(
+      `${NPM_REGISTRY}/${pkg.replace("/", "%2F")}/latest`,
+      { method: "GET" },
+    );
     return res.ok;
   } catch {
     return false;

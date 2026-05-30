@@ -26,6 +26,9 @@ import {
 
 const DEFAULT_CONCURRENCY = 3;
 const DEFAULT_SCAN_TIMEOUT_MS = 60_000;
+// Render cron has a hard runtime ceiling; the full registry is far larger than
+// any single window. The worker scans the oldest N per run and rotates through.
+const DEFAULT_MAX_PER_RUN = 200;
 
 interface RunCounters {
   total: number;
@@ -153,12 +156,13 @@ async function drain(
 export async function runWorker(): Promise<RunCounters> {
   const concurrency = envInt("MCP_VOUCH_CONCURRENCY", DEFAULT_CONCURRENCY);
   const scanTimeoutMs = envInt("MCP_VOUCH_SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS);
+  const maxPerRun = envInt("MCP_VOUCH_MAX_PER_RUN", DEFAULT_MAX_PER_RUN);
 
   const client = getSupabase();
-  const servers = await listActiveServers(client);
+  const servers = await listActiveServers(client, maxPerRun);
   // eslint-disable-next-line no-console
   console.log(
-    `mcp-vouch worker: ${servers.length} servers, concurrency=${concurrency}, timeout=${scanTimeoutMs}ms`,
+    `mcp-vouch worker: ${servers.length} servers this run (cap=${maxPerRun}), concurrency=${concurrency}, timeout=${scanTimeoutMs}ms`,
   );
 
   const outcomes = await drain(servers, concurrency, (s) =>

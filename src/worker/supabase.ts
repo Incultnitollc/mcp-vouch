@@ -22,6 +22,7 @@ interface ServerWithVersionsRow {
   name: string;
   repo_url: string | null;
   server_versions: { source_url: string | null; published_at: string | null }[] | null;
+  trust_scores: { scanned_at: string | null }[] | null;
 }
 
 function pickSourceUrl(row: ServerWithVersionsRow): string | null {
@@ -36,6 +37,11 @@ function pickSourceUrl(row: ServerWithVersionsRow): string | null {
     if (url) return url;
   }
   return row.repo_url;
+}
+
+function lastScannedAt(row: ServerWithVersionsRow): number {
+  const ts = row.trust_scores?.[0]?.scanned_at;
+  return ts ? Date.parse(ts) : 0;
 }
 
 export interface TrustScoreUpsert {
@@ -62,22 +68,29 @@ export function getSupabase(): SupabaseClient {
 
 /**
  * Page through every active server in the registry, joining each row with its
- * `server_versions` so we can pick the latest version's `source_url`. Falls
- * back to `servers.repo_url` when no version row has a source URL. Returns a
- * flat shape ({id, slug, name, source_url}) so callers don't see the join.
+ * `server_versions` (for source_url) and `trust_scores` (for prioritization).
+ *
+ * The registry has thousands of servers; a single cron run can't scan them
+ * all in the platform's time budget. We fetch every active row, sort
+ * unscanned-first then oldest-scanned-first, and the worker takes the top
+ * `maxPerRun` so each cron tick advances coverage instead of restarting
+ * from the top of the alphabet.
  */
 export async function listActiveServers(
   client: SupabaseClient,
+  maxPerRun: number,
 ): Promise<RegistryServerRow[]> {
-  const pageSize = 500;
-  const rows: RegistryServerRow[] = [];
+  const pageSize = 1000;
+  const raw: ServerWithVersionsRow[] = [];
   let from = 0;
 
   for (;;) {
     const to = from + pageSize - 1;
     const { data, error } = await client
       .from("servers")
-      .select("id,slug,name,repo_url,server_versions(source_url,published_at)")
+      .select(
+        "id,slug,name,repo_url,server_versions(source_url,published_at),trust_scores(scanned_at)",
+      )
       .is("deleted_at", null)
       .order("created_at", { ascending: true })
       .range(from, to);
@@ -85,19 +98,22 @@ export async function listActiveServers(
     if (error) throw new Error(`Failed to list servers: ${error.message}`);
     if (!data || data.length === 0) break;
 
-    for (const raw of data as ServerWithVersionsRow[]) {
-      rows.push({
-        id: raw.id,
-        slug: raw.slug,
-        name: raw.name,
-        source_url: pickSourceUrl(raw),
-      });
-    }
+    raw.push(...(data as ServerWithVersionsRow[]));
     if (data.length < pageSize) break;
     from += pageSize;
   }
 
-  return rows;
+  // Unscanned (scanned_at = 0) first, then oldest scan first. Cron runs every
+  // 6h with maxPerRun rows, so each row gets re-scanned roughly every
+  // (rows / (maxPerRun * 4)) days.
+  raw.sort((a, b) => lastScannedAt(a) - lastScannedAt(b));
+
+  return raw.slice(0, maxPerRun).map((row) => ({
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    source_url: pickSourceUrl(row),
+  }));
 }
 
 export async function upsertTrustScore(

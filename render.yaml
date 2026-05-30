@@ -40,5 +40,7 @@ services:
         value: "3"
       - key: MCP_VOUCH_SCAN_TIMEOUT_MS
         value: "60000"
+      - key: MCP_VOUCH_MAX_PER_RUN
+        value: "200"
       - key: NODE_VERSION
         value: "22.14.0"
