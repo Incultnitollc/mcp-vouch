@@ -1,6 +1,11 @@
 // Supabase client for the trust-scoring worker. Uses the service-role key so
 // it can write to `trust_scores` (RLS bypass). The key MUST be set in Render
 // env vars, never committed.
+//
+// Source-URL resolution: the registry stores the canonical install URL on
+// `server_versions.source_url` (npmjs.com or github URL). We pick the latest
+// version's source_url and fall back to `servers.repo_url` when no version
+// row has one. The install-resolver then maps that URL → `npx -y <pkg>`.
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
@@ -9,6 +14,28 @@ export interface RegistryServerRow {
   slug: string;
   name: string;
   source_url: string | null;
+}
+
+interface ServerWithVersionsRow {
+  id: string;
+  slug: string;
+  name: string;
+  repo_url: string | null;
+  server_versions: { source_url: string | null; published_at: string | null }[] | null;
+}
+
+function pickSourceUrl(row: ServerWithVersionsRow): string | null {
+  const versions = row.server_versions ?? [];
+  if (versions.length > 0) {
+    const sorted = [...versions].sort((a, b) => {
+      const ta = a.published_at ? Date.parse(a.published_at) : 0;
+      const tb = b.published_at ? Date.parse(b.published_at) : 0;
+      return tb - ta;
+    });
+    const url = sorted.find((v) => v.source_url)?.source_url ?? null;
+    if (url) return url;
+  }
+  return row.repo_url;
 }
 
 export interface TrustScoreUpsert {
@@ -34,8 +61,10 @@ export function getSupabase(): SupabaseClient {
 }
 
 /**
- * Page through every active server in the registry. `source_url` may be null;
- * the resolver decides whether the server is scannable.
+ * Page through every active server in the registry, joining each row with its
+ * `server_versions` so we can pick the latest version's `source_url`. Falls
+ * back to `servers.repo_url` when no version row has a source URL. Returns a
+ * flat shape ({id, slug, name, source_url}) so callers don't see the join.
  */
 export async function listActiveServers(
   client: SupabaseClient,
@@ -46,11 +75,9 @@ export async function listActiveServers(
 
   for (;;) {
     const to = from + pageSize - 1;
-    // The registry schema uses `source_url` as a column on `servers`
-    // (see MCP Registry - 2 install-resolver) — pull it directly.
     const { data, error } = await client
       .from("servers")
-      .select("id,slug,name,source_url")
+      .select("id,slug,name,repo_url,server_versions(source_url,published_at)")
       .is("deleted_at", null)
       .order("created_at", { ascending: true })
       .range(from, to);
@@ -58,7 +85,14 @@ export async function listActiveServers(
     if (error) throw new Error(`Failed to list servers: ${error.message}`);
     if (!data || data.length === 0) break;
 
-    rows.push(...(data as RegistryServerRow[]));
+    for (const raw of data as ServerWithVersionsRow[]) {
+      rows.push({
+        id: raw.id,
+        slug: raw.slug,
+        name: raw.name,
+        source_url: pickSourceUrl(raw),
+      });
+    }
     if (data.length < pageSize) break;
     from += pageSize;
   }
