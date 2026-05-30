@@ -1,0 +1,44 @@
+# Render blueprint — MCP Vouch trust-scoring worker.
+# https://render.com/docs/blueprint-spec
+#
+# Single cron service that scores every active MCP Registry server every 6
+# hours and upserts the report into Supabase `trust_scores`. Web hosting for
+# mcpvouch.com is on Cloudflare Pages (or wherever the landing eventually
+# lives) — this file only describes the worker.
+#
+# Apply: connect this repo in the Render dashboard. Render reads render.yaml
+# from the repo root and provisions the listed services.
+
+services:
+  # -------------------------------------------------------------------------
+  # mcp-vouch-worker — trust scoring (every 6 hours).
+  #
+  # Sandbox boundary: install-resolver only accepts servers whose source_url
+  # resolves to an npm package; they're launched via `npx -y <pkg>`. Anything
+  # else is logged + skipped (never executed).
+  #
+  # Concurrency + per-scan timeout are envInt-tunable from the Render
+  # dashboard without a redeploy.
+  # -------------------------------------------------------------------------
+  - type: cron
+    name: mcp-vouch-worker
+    runtime: node
+    plan: starter
+    region: oregon
+    schedule: "0 */6 * * *"  # every 6 hours, on the hour, UTC
+    buildCommand: |
+      npm ci
+      npm run build
+    startCommand: |
+      node dist/worker/index.js
+    envVars:
+      - key: SUPABASE_URL
+        sync: false                       # set in Render dashboard
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false                       # set in Render dashboard — never commit
+      - key: MCP_VOUCH_CONCURRENCY
+        value: "3"
+      - key: MCP_VOUCH_SCAN_TIMEOUT_MS
+        value: "60000"
+      - key: NODE_VERSION
+        value: "22.14.0"
