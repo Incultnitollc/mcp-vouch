@@ -78,10 +78,12 @@ The library is what the MCP Registry scoring worker uses to score every listing 
 Once your server is listed on the [MCP Registry](https://github.com/Incultnitollc/mcp-registry), you can embed its live trust badge in your README:
 
 ```markdown
-[![MCP Vouch](https://mcpvouch.com/api/badge/<server-slug>.svg)](https://mcp-registry-dh5.pages.dev/server/<server-slug>)
+[![MCP Vouch](https://mcp-registry-dh5.pages.dev/api/badge/<slug>.svg)](https://mcp-registry-dh5.pages.dev/servers/<slug>/)
 ```
 
-The badge renders the latest score + grade with the standard shields color scale (A green → F red) and links back to the full trust report on the registry. Updated automatically every 6 hours.
+The badge renders the latest score + grade with a shields-style color scale (A green → F red) and links back to the full trust report on the registry. Served by a Cloudflare Pages Function reading from the trust-scores table — updated automatically every 6 hours by the scoring worker.
+
+Once `mcpvouch.com` has a landing page, the canonical badge URL will be `https://mcpvouch.com/api/badge/<slug>.svg` (the registry endpoint will keep working as an alias).
 
 ## What it checks
 
