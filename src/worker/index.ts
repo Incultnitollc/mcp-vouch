@@ -11,7 +11,7 @@
 // are skipped (logged), not scored against — we never score what we couldn't
 // safely launch.
 
-import { scanServer } from "../lib.js";
+import { TrustScanner } from "../scanners/trust-scanner.js";
 import {
   blockToCommand,
   resolveInstall,
@@ -93,9 +93,14 @@ async function scanOne(
   }
 
   const command = blockToCommand(resolved.block);
+  // Construct the scanner directly (instead of lib.ts's scanServer wrapper) so
+  // we keep a reference and can dispose() it on timeout/error — otherwise the
+  // spawned `npx -y <pkg>` child outlives the scan promise and holds RSS until
+  // the cron container exits. See issue #1.
+  const scanner = new TrustScanner(command);
   try {
     const report = await withTimeout(
-      scanServer(command),
+      scanner.scan(),
       scanTimeoutMs,
       `scan ${server.slug}`,
     );
@@ -112,6 +117,9 @@ async function scanOne(
     });
     return { server, result: "scanned", note: `${report.totalScore}/${report.grade}` };
   } catch (err) {
+    // Force-kill the orphan stdio child. dispose() is idempotent so it's safe
+    // even when the failure happened after the scanner already disconnected.
+    await scanner.dispose().catch(() => {});
     const message = err instanceof Error ? err.message : String(err);
     const timedOut = /^Timed out after/.test(message);
     return {

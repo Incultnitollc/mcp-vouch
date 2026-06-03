@@ -137,6 +137,15 @@ export class TrustScanner {
     this.client = null;
   }
 
+  /**
+   * Force-release the underlying client and transport (kills the spawned stdio
+   * child). Safe to call from outside after a timed-out or failed scan — the
+   * worker uses this to prevent orphan `npx` processes from holding RSS. Idempotent.
+   */
+  async dispose(): Promise<void> {
+    await this.disconnect();
+  }
+
   private requireClient(): Client {
     if (!this.client) throw new Error("Not connected.");
     return this.client;
