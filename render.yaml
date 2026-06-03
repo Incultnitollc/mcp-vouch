@@ -36,8 +36,14 @@ services:
         sync: false                       # set in Render dashboard
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false                       # set in Render dashboard — never commit
+      # OOM fix 2026-06-03: 3 concurrent `npx -y <pkg>` child processes
+      # routinely hit Render starter's 512 MiB ceiling. Drop to 2 and clamp
+      # V8's old-space below the container limit so GC runs hard *before*
+      # the OOM killer does. See Render alert: "Out of memory (used over 512Mi)".
       - key: MCP_VOUCH_CONCURRENCY
-        value: "3"
+        value: "2"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=400"
       - key: MCP_VOUCH_SCAN_TIMEOUT_MS
         value: "60000"
       - key: MCP_VOUCH_MAX_PER_RUN
