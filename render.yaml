@@ -36,12 +36,15 @@ services:
         sync: false                       # set in Render dashboard
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false                       # set in Render dashboard — never commit
-      # OOM fix 2026-06-03: 3 concurrent `npx -y <pkg>` child processes
-      # routinely hit Render starter's 512 MiB ceiling. Drop to 2 and clamp
-      # V8's old-space below the container limit so GC runs hard *before*
-      # the OOM killer does. See Render alert: "Out of memory (used over 512Mi)".
+      # OOM root cause (2026-06-03 verification): orphan-child dispose fix
+      # shipped (4d34fc9) but didn't solve OOM. Both post-fix runs (12:00 +
+      # 18:00 UTC 6/3) still OOM'd at ~server #23, identical signature.
+      # Real culprit: concurrent `npx -y <pkg>` installs of native-binary
+      # packages (node-gyp / prebuild-install) blow 512Mi regardless of
+      # orphan cleanup. Drop to serial. If 1 still OOMs the parent worker
+      # alone is over budget → upgrade Render plan starter → standard 2Gi.
       - key: MCP_VOUCH_CONCURRENCY
-        value: "2"
+        value: "1"
       - key: NODE_OPTIONS
         value: "--max-old-space-size=400"
       - key: MCP_VOUCH_SCAN_TIMEOUT_MS
