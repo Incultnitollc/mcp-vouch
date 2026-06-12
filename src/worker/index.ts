@@ -114,13 +114,18 @@ async function scanOne(
   const guard = new Promise<never>((_, reject) => {
     watchdog.start((used) => reject(new MemoryExceededError(used, memLimitBytes)));
   });
-  // Prevent an unhandled-rejection warning if the scan wins the race.
+  // Prevent an unhandled-rejection crash if the scan wins the race.
   guard.catch(() => {});
+  // Hoist the scan promise so we can attach our own rejection handler: when the
+  // watchdog wins Promise.race below, this promise LOSES but still settles later
+  // — its child was just SIGKILLed, so it rejects with a transport error. With
+  // no handler that's an unhandledRejection, which Node 22 treats as fatal and
+  // kills the whole 200-server run. The no-op catch marks it handled; the race
+  // still reads its resolved value when the scan wins.
+  const scanP = withTimeout(scanner.scan(), scanTimeoutMs, `scan ${server.slug}`);
+  scanP.catch(() => {});
   try {
-    const report = await Promise.race([
-      withTimeout(scanner.scan(), scanTimeoutMs, `scan ${server.slug}`),
-      guard,
-    ]);
+    const report = await Promise.race([scanP, guard]);
     await upsertTrustScore(client, {
       server_id: server.id,
       total_score: report.totalScore,
@@ -224,6 +229,16 @@ export async function runWorker(): Promise<RunCounters> {
   );
   return counters;
 }
+
+// Defense in depth: a batch worker that spawns + kills hundreds of child
+// processes will occasionally produce a late rejection from an aborted scan's
+// transport after we've already moved on. Node 22 treats an unhandledRejection
+// as fatal (exits non-zero), which would abort the whole run. Log and keep
+// going — scanOne already converts every per-server failure into an outcome.
+process.on("unhandledRejection", (reason) => {
+  // eslint-disable-next-line no-console
+  console.error("mcp-vouch worker: swallowed unhandledRejection:", reason);
+});
 
 // Render cron entrypoint.
 runWorker().then(
