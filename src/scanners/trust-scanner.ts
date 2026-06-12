@@ -9,14 +9,60 @@
 // Each check's `details` states exactly what was tested and what its limits are.
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type {
   CheckResult,
   Grade,
+  ScanTarget,
   ServerInfo,
   TrustReport,
 } from "../types/index.js";
 import { MAX_POINTS_PER_CHECK } from "../types/index.js";
+
+/**
+ * Why a remote (HTTP) handshake failed, distinguished from a genuine error so
+ * the worker can record it as a SKIP (not a failure) and avoid alert fatigue:
+ *   - "auth": endpoint requires authentication we don't have (401, or 403 with
+ *     OAuth/WWW-Authenticate markers). Honest: we couldn't inspect it.
+ *   - "challenge": a bot-protection wall (Cloudflare "just a moment", cf-ray,
+ *     or an HTML body where MCP JSON was expected). Not the server's fault line.
+ *   - "other": real connection failure (DNS, 5xx, timeout) — counts as failed.
+ */
+export type RemoteErrorKind = "auth" | "challenge" | "other";
+
+export function classifyRemoteError(err: unknown): RemoteErrorKind {
+  const message = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  const code = typeof (err as { code?: unknown })?.code === "number"
+    ? (err as { code: number }).code
+    : undefined;
+
+  // Cloudflare / bot-wall: HTML where JSON/SSE was expected, or explicit markers.
+  if (
+    /just a moment|cf-ray|cloudflare|attention required|checking your browser|enable javascript/.test(
+      message,
+    ) ||
+    /unexpected token '?<|<!doctype|<html/.test(message)
+  ) {
+    return "challenge";
+  }
+
+  // Authentication required.
+  if (
+    code === 401 ||
+    /\b401\b|unauthorized|www-authenticate|authentication required|invalid token|oauth/.test(
+      message,
+    )
+  ) {
+    return "auth";
+  }
+  // A bare 403 with no CF markers is most often an auth/permission gate.
+  if (code === 403 || /\b403\b|forbidden/.test(message)) return "auth";
+
+  return "other";
+}
 
 /** Patterns that suggest a tool description is trying to inject instructions. */
 const INJECTION_PATTERNS: RegExp[] = [
@@ -50,8 +96,7 @@ const SHADOW_TARGETS = new Set([
 ]);
 
 export class TrustScanner {
-  private readonly command: string;
-  private readonly extraEnv: Record<string, string>;
+  private readonly target: ScanTarget;
   private client: Client | null = null;
   private serverInfo: ServerInfo = {
     name: "unknown",
@@ -60,16 +105,26 @@ export class TrustScanner {
   };
 
   /**
-   * @param command e.g. "npx -y @modelcontextprotocol/server-everything"
-   * @param extraEnv extra env vars merged into the spawned child on top of the
-   *   SDK's safe-inherit defaults. The worker passes NPM_CONFIG_IGNORE_SCRIPTS
-   *   here so `npx -y` never runs native build scripts (the OOM source). Must be
+   * @param target Either a stdio launch command string (back-compat — e.g.
+   *   `"npx -y @modelcontextprotocol/server-everything"`), or a {@link ScanTarget}
+   *   (stdio with extra env, or an `http` remote endpoint).
+   * @param extraEnv Extra env vars merged into the spawned stdio child on top of
+   *   the SDK's safe-inherit defaults (e.g. NPM_CONFIG_IGNORE_SCRIPTS). Must be
    *   passed via the transport because the SDK spawns with a sanitized env
-   *   safelist, not the parent's full environment.
+   *   safelist, not the parent's full environment. Ignored for http targets.
    */
-  constructor(command: string, extraEnv: Record<string, string> = {}) {
-    this.command = command.trim();
-    this.extraEnv = extraEnv;
+  constructor(target: string | ScanTarget, extraEnv: Record<string, string> = {}) {
+    if (typeof target === "string") {
+      this.target = { kind: "stdio", command: target.trim(), extraEnv };
+    } else if (target.kind === "stdio") {
+      this.target = {
+        kind: "stdio",
+        command: target.command.trim(),
+        extraEnv: { ...target.extraEnv, ...extraEnv },
+      };
+    } else {
+      this.target = target;
+    }
   }
 
   /** Connect, run all 10 checks, disconnect, and return the report. */
@@ -106,24 +161,14 @@ export class TrustScanner {
   // --- connection -----------------------------------------------------------
 
   private async connect(): Promise<void> {
-    const parts = this.command.split(/\s+/).filter(Boolean);
-    if (parts.length === 0) {
-      throw new Error("Empty server command.");
-    }
-    const [cmd, ...args] = parts;
-
-    // The SDK merges this `env` with its safe-inherit defaults (HOME/PATH/…),
-    // so extraEnv (e.g. NPM_CONFIG_IGNORE_SCRIPTS) reaches the `npx` child even
-    // though the parent's full environment is intentionally not forwarded.
-    const transport = new StdioClientTransport({
-      command: cmd,
-      args,
-      ...(Object.keys(this.extraEnv).length > 0 ? { env: this.extraEnv } : {}),
-    });
+    const transport =
+      this.target.kind === "http"
+        ? this.makeHttpTransport(this.target)
+        : this.makeStdioTransport(this.target);
 
     // The SDK reports the negotiated protocol version by calling the transport's
-    // optional `setProtocolVersion` hook during initialize. stdio doesn't store
-    // it, so we attach our own hook to capture it cleanly.
+    // optional `setProtocolVersion` hook during initialize. The transports don't
+    // store it, so we attach our own hook to capture it cleanly.
     let protocolVersion = "unknown";
     (transport as { setProtocolVersion?: (v: string) => void }).setProtocolVersion =
       (v: string) => {
@@ -142,6 +187,32 @@ export class TrustScanner {
       version: impl?.version ?? "unknown",
       protocolVersion,
     };
+  }
+
+  private makeStdioTransport(target: Extract<ScanTarget, { kind: "stdio" }>): Transport {
+    const parts = target.command.split(/\s+/).filter(Boolean);
+    if (parts.length === 0) {
+      throw new Error("Empty server command.");
+    }
+    const [cmd, ...args] = parts;
+    const extraEnv = target.extraEnv ?? {};
+    // The SDK merges this `env` with its safe-inherit defaults (HOME/PATH/…),
+    // so extraEnv (e.g. NPM_CONFIG_IGNORE_SCRIPTS) reaches the `npx` child even
+    // though the parent's full environment is intentionally not forwarded.
+    return new StdioClientTransport({
+      command: cmd!,
+      args,
+      ...(Object.keys(extraEnv).length > 0 ? { env: extraEnv } : {}),
+    });
+  }
+
+  private makeHttpTransport(target: Extract<ScanTarget, { kind: "http" }>): Transport {
+    // Connect unauthenticated. Auth-gated endpoints reject the handshake; the
+    // worker classifies that (classifyRemoteError) as a skip, not a failure.
+    const url = new URL(target.url);
+    return target.transport === "sse"
+      ? new SSEClientTransport(url)
+      : new StreamableHTTPClientTransport(url);
   }
 
   private async disconnect(): Promise<void> {
@@ -327,21 +398,49 @@ export class TrustScanner {
 
   // MCP05 — Missing Authentication: only meaningful for network-exposed servers.
   private async checkAuthentication(): Promise<Omit<CheckResult, "id" | "name" | "duration">> {
+    if (this.target.kind !== "http") {
+      return {
+        status: "SKIP",
+        score: 0,
+        details:
+          "Scanned over local stdio, where authentication is not applicable (the client owns the process). This check is active when scanning an HTTP/SSE endpoint.",
+      };
+    }
+    // We reached the checks, so the server completed an MCP handshake for an
+    // unauthenticated client. Auth-required endpoints reject before this point
+    // (the worker records them as skipped, not scored). A public endpoint isn't
+    // automatically wrong, but a network-exposed MCP server that needs no auth
+    // to initialize and list tools is a real exposure worth flagging.
     return {
-      status: "SKIP",
-      score: 0,
+      status: "WARN",
+      score: 5,
       details:
-        "Scanned over local stdio, where authentication is not applicable (the client owns the process). This check becomes active when scanning an HTTP/SSE endpoint.",
+        "Server accepted an unauthenticated MCP session over the network (no credentials supplied). Network-exposed endpoints should require authentication (e.g. OAuth/bearer) and gate every tool call server-side. Confirm sensitive tools aren't reachable anonymously.",
     };
   }
 
   // MCP06 — Insecure Transport: only meaningful for HTTP transport.
   private async checkTransport(): Promise<Omit<CheckResult, "id" | "name" | "duration">> {
+    if (this.target.kind !== "http") {
+      return {
+        status: "SKIP",
+        score: 0,
+        details:
+          "Transport is local stdio; HTTP-specific protections (TLS, Host-header validation, origin checks) do not apply. This check is active when scanning an HTTP/SSE endpoint.",
+      };
+    }
+    if (!/^https:\/\//i.test(this.target.url)) {
+      return {
+        status: "FAIL",
+        score: 0,
+        details:
+          "Endpoint is served over plaintext http:// — all traffic, including any bearer tokens and tool arguments, is unencrypted and tamperable on the wire. Serve over https:// with a valid TLS certificate.",
+      };
+    }
     return {
-      status: "SKIP",
-      score: 0,
-      details:
-        "Transport is local stdio; HTTP-specific protections (Host-header validation, TLS, origin checks) do not apply. Active when scanning an HTTP/SSE endpoint.",
+      status: "PASS",
+      score: 10,
+      details: `Endpoint is served over TLS (https) via the ${this.target.transport} transport. Transport-level confidentiality and integrity are in place.`,
     };
   }
 
@@ -423,7 +522,15 @@ export class TrustScanner {
 
   // MCP10 — Supply Chain Risk: is the server package version-pinned?
   private async checkSupplyChain(): Promise<Omit<CheckResult, "id" | "name" | "duration">> {
-    const cmd = this.command;
+    if (this.target.kind === "http") {
+      return {
+        status: "WARN",
+        score: 6,
+        details:
+          "Remote hosted endpoint: you depend on the operator's live deployment, which can be updated at any time and isn't version-pinnable from the registry. Supply-chain trust here rests on the operator's release and infrastructure practices rather than a pinned package.",
+      };
+    }
+    const cmd = this.target.command;
     const isNpx = /\bnpx\b/.test(cmd);
     // Look for a pinned version like "pkg@1.2.3" anywhere in the command.
     const pinned = /@\d+\.\d+\.\d+/.test(cmd);

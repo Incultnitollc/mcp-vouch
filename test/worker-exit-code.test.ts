@@ -10,6 +10,8 @@ function counters(over: Partial<{
   scanned: number;
   skipped_unresolved: number;
   skipped_oversized: number;
+  skipped_auth_required: number;
+  skipped_challenge: number;
   failed: number;
   timed_out: number;
 }> = {}) {
@@ -18,6 +20,8 @@ function counters(over: Partial<{
     scanned: 0,
     skipped_unresolved: 0,
     skipped_oversized: 0,
+    skipped_auth_required: 0,
+    skipped_challenge: 0,
     failed: 0,
     timed_out: 0,
     ...over,
@@ -56,5 +60,35 @@ describe("exitCodeForRun", () => {
     expect(
       exitCodeForRun(counters({ total: 6, skipped_unresolved: 4, scanned: 1, failed: 1 })),
     ).toBe(0);
+  });
+
+  it("greens an all-auth-gated remote slice (couldn't inspect ≠ failure)", () => {
+    expect(
+      exitCodeForRun(counters({ total: 12, skipped_auth_required: 12 })),
+    ).toBe(0);
+  });
+
+  it("greens an all-Cloudflare-challenge slice", () => {
+    expect(
+      exitCodeForRun(counters({ total: 8, skipped_challenge: 8 })),
+    ).toBe(0);
+  });
+
+  it("greens a mixed uninspectable slice (unresolved + auth + challenge, none failed)", () => {
+    expect(
+      exitCodeForRun(
+        counters({ total: 9, skipped_unresolved: 3, skipped_auth_required: 4, skipped_challenge: 2 }),
+      ),
+    ).toBe(0);
+  });
+
+  it("reds when the only inspectable remote (past the auth/challenge walls) failed", () => {
+    // 5 auth-gated + 2 challenged + 1 reachable remote that errored → the one we
+    // could actually inspect failed, so this is a real regression.
+    expect(
+      exitCodeForRun(
+        counters({ total: 8, skipped_auth_required: 5, skipped_challenge: 2, failed: 1 }),
+      ),
+    ).toBe(2);
   });
 });

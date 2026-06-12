@@ -8,12 +8,19 @@
 // row has one. The install-resolver then maps that URL → `npx -y <pkg>`.
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { RemoteEndpoint } from "./install-resolver.js";
 
 export interface RegistryServerRow {
   id: string;
   slug: string;
   name: string;
   source_url: string | null;
+  /** Remote HTTP endpoints from card_summary_json.remotes[] (may be empty). */
+  remotes: RemoteEndpoint[] | null;
+}
+
+interface CardSummary {
+  remotes?: { url?: string; type?: string }[] | null;
 }
 
 interface ServerWithVersionsRow {
@@ -21,8 +28,21 @@ interface ServerWithVersionsRow {
   slug: string;
   name: string;
   repo_url: string | null;
+  card_summary_json: CardSummary | null;
   server_versions: { source_url: string | null; published_at: string | null }[] | null;
   trust_scores: { scanned_at: string | null }[] | null;
+}
+
+/** Pull connectable remotes (url + type both present) from the card summary. */
+function pickRemotes(row: ServerWithVersionsRow): RemoteEndpoint[] | null {
+  const raw = row.card_summary_json?.remotes;
+  if (!raw || raw.length === 0) return null;
+  const remotes = raw
+    .filter((r): r is { url: string; type: string } =>
+      typeof r?.url === "string" && typeof r?.type === "string",
+    )
+    .map((r) => ({ url: r.url, type: r.type }));
+  return remotes.length > 0 ? remotes : null;
 }
 
 function pickSourceUrl(row: ServerWithVersionsRow): string | null {
@@ -136,7 +156,7 @@ export async function listActiveServers(
     const { data, error } = await client
       .from("servers")
       .select(
-        "id,slug,name,repo_url,server_versions(source_url,published_at),trust_scores(scanned_at)",
+        "id,slug,name,repo_url,card_summary_json,server_versions(source_url,published_at),trust_scores(scanned_at)",
       )
       .is("deleted_at", null)
       .order("created_at", { ascending: true })
@@ -159,6 +179,7 @@ export async function listActiveServers(
     slug: row.slug,
     name: row.name,
     source_url: pickSourceUrl(row),
+    remotes: pickRemotes(row),
   }));
 }
 

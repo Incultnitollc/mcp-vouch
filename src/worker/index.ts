@@ -16,12 +16,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { argv } from "node:process";
 import { pathToFileURL } from "node:url";
-import { TrustScanner } from "../scanners/trust-scanner.js";
-import {
-  blockToCommand,
-  resolveInstall,
-  type ResolveResult,
-} from "./install-resolver.js";
+import { TrustScanner, classifyRemoteError } from "../scanners/trust-scanner.js";
+import type { ScanTarget } from "../types/index.js";
+import { resolveScanTarget } from "./install-resolver.js";
 import {
   MemoryExceededError,
   MemoryWatchdog,
@@ -53,13 +50,24 @@ interface RunCounters {
   scanned: number;
   skipped_unresolved: number;
   skipped_oversized: number;
+  skipped_auth_required: number;
+  skipped_challenge: number;
   failed: number;
   timed_out: number;
 }
 
+type ScanResult =
+  | "scanned"
+  | "skipped_unresolved"
+  | "skipped_oversized"
+  | "skipped_auth_required"
+  | "skipped_challenge"
+  | "failed"
+  | "timed_out";
+
 interface ScanOutcome {
   server: RegistryServerRow;
-  result: "scanned" | "skipped_unresolved" | "skipped_oversized" | "failed" | "timed_out";
+  result: ScanResult;
   note?: string;
 }
 
@@ -121,25 +129,85 @@ async function scanOne(
   memLimitBytes: number,
   memPollMs: number,
 ): Promise<ScanOutcome> {
-  let resolved: ResolveResult;
+  let target: ScanTarget | null;
   try {
-    resolved = await resolveInstall(server.source_url);
+    target = await resolveScanTarget(server);
   } catch (err) {
     return {
       server,
       result: "failed",
-      note: `resolveInstall failed: ${err instanceof Error ? err.message : String(err)}`,
+      note: `resolveScanTarget failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-  if (!resolved.block) {
+  if (!target) {
     return {
       server,
       result: "skipped_unresolved",
-      note: `source_url=${server.source_url ?? "null"} did not resolve to an npm package`,
+      note: `source_url=${server.source_url ?? "null"} resolved to neither an npm package nor a remote endpoint`,
     };
   }
 
-  const command = blockToCommand(resolved.block);
+  // Remote HTTP endpoints launch nothing locally: no OOM/sandbox risk, so they
+  // skip the memory watchdog + npm-cache machinery and take the simpler path.
+  if (target.kind === "http") {
+    return scanRemote(client, server, target, scanTimeoutMs);
+  }
+  return scanStdio(client, server, target, scanTimeoutMs, memLimitBytes, memPollMs);
+}
+
+/**
+ * Scan a remote (HTTP) MCP endpoint. Connects unauthenticated; handshake
+ * failures are classified (classifyRemoteError) so an auth wall or a Cloudflare
+ * challenge is recorded as a SKIP rather than a failure — neither reddens the
+ * cron (see exitCodeForRun).
+ */
+async function scanRemote(
+  client: ReturnType<typeof getSupabase>,
+  server: RegistryServerRow,
+  target: Extract<ScanTarget, { kind: "http" }>,
+  scanTimeoutMs: number,
+): Promise<ScanOutcome> {
+  const scanner = new TrustScanner(target);
+  try {
+    const report = await withTimeout(scanner.scan(), scanTimeoutMs, `scan ${server.slug}`);
+    await upsertTrustScore(client, {
+      server_id: server.id,
+      total_score: report.totalScore,
+      grade: report.grade,
+      checks: report.checks,
+      server_name: report.serverInfo.name,
+      server_version: report.serverInfo.version,
+      protocol_version: report.serverInfo.protocolVersion,
+      scanned_at: report.scannedAt,
+      scan_duration_ms: report.duration,
+    });
+    return { server, result: "scanned", note: `${report.totalScore}/${report.grade} (http)` };
+  } catch (err) {
+    await scanner.dispose().catch(() => {});
+    const message = err instanceof Error ? err.message : String(err);
+    if (/^Timed out after/.test(message)) {
+      return { server, result: "timed_out", note: message };
+    }
+    const kind = classifyRemoteError(err);
+    if (kind === "auth") {
+      return { server, result: "skipped_auth_required", note: `auth required: ${message}` };
+    }
+    if (kind === "challenge") {
+      return { server, result: "skipped_challenge", note: `bot challenge: ${message}` };
+    }
+    return { server, result: "failed", note: message };
+  }
+}
+
+async function scanStdio(
+  client: ReturnType<typeof getSupabase>,
+  server: RegistryServerRow,
+  target: Extract<ScanTarget, { kind: "stdio" }>,
+  scanTimeoutMs: number,
+  memLimitBytes: number,
+  memPollMs: number,
+): Promise<ScanOutcome> {
+  const command = target.command;
   // Construct the scanner directly (instead of lib.ts's scanServer wrapper) so
   // we keep a reference and can dispose() it on timeout/error — otherwise the
   // spawned `npx -y <pkg>` child outlives the scan promise and holds RSS until
@@ -273,17 +341,20 @@ export async function runWorker(): Promise<RunCounters> {
     scanOne(client, s, scanTimeoutMs, memLimitBytes, memPollMs),
   );
 
+  const count = (r: ScanResult) => outcomes.filter((o) => o.result === r).length;
   const counters: RunCounters = {
     total: servers.length,
-    scanned: outcomes.filter((o) => o.result === "scanned").length,
-    skipped_unresolved: outcomes.filter((o) => o.result === "skipped_unresolved").length,
-    skipped_oversized: outcomes.filter((o) => o.result === "skipped_oversized").length,
-    failed: outcomes.filter((o) => o.result === "failed").length,
-    timed_out: outcomes.filter((o) => o.result === "timed_out").length,
+    scanned: count("scanned"),
+    skipped_unresolved: count("skipped_unresolved"),
+    skipped_oversized: count("skipped_oversized"),
+    skipped_auth_required: count("skipped_auth_required"),
+    skipped_challenge: count("skipped_challenge"),
+    failed: count("failed"),
+    timed_out: count("timed_out"),
   };
   // eslint-disable-next-line no-console
   console.log(
-    `mcp-vouch worker done: scanned=${counters.scanned} skipped=${counters.skipped_unresolved} oversized=${counters.skipped_oversized} timed_out=${counters.timed_out} failed=${counters.failed} total=${counters.total}`,
+    `mcp-vouch worker done: scanned=${counters.scanned} skipped=${counters.skipped_unresolved} oversized=${counters.skipped_oversized} auth=${counters.skipped_auth_required} challenge=${counters.skipped_challenge} timed_out=${counters.timed_out} failed=${counters.failed} total=${counters.total}`,
   );
   return counters;
 }
@@ -291,19 +362,23 @@ export async function runWorker(): Promise<RunCounters> {
 /**
  * Process exit code from a run's counters.
  *
- * A slice that's entirely non-npm (every server skipped_unresolved) is NOT a
- * failure — the scanner simply has nothing it can launch this run, which is
- * normal because most of the registry is non-npm and the batch rotates. The old
- * rule (`total > 0 && scanned === 0 -> 2`) reddened those runs and trained the
- * team to ignore the cron's status (alert fatigue).
+ * A slice we couldn't inspect is NOT a failure — there's simply nothing to
+ * score. That covers servers that resolved to no target (skipped_unresolved),
+ * remote endpoints behind an auth wall (skipped_auth_required), and remote
+ * endpoints behind a bot challenge (skipped_challenge). All are normal because
+ * most of the registry is non-npm/auth-gated and the batch rotates. The old rule
+ * (`total > 0 && scanned === 0 -> 2`) reddened those runs and trained the team
+ * to ignore the cron's status (alert fatigue).
  *
- * Red (exit 2) only when servers we COULD resolve all failed to produce a score
- * — i.e. resolvable > 0 and scanned === 0. That's a real regression worth an
- * alert; everything else is green.
+ * Red (exit 2) only when servers we COULD actually inspect all failed to produce
+ * a score — i.e. inspectable > 0 and scanned === 0. That's a real regression
+ * worth an alert; everything else is green.
  */
 export function exitCodeForRun(c: RunCounters): 0 | 2 {
-  const resolvable = c.total - c.skipped_unresolved;
-  return resolvable > 0 && c.scanned === 0 ? 2 : 0;
+  const uninspectable =
+    c.skipped_unresolved + c.skipped_auth_required + c.skipped_challenge;
+  const inspectable = c.total - uninspectable;
+  return inspectable > 0 && c.scanned === 0 ? 2 : 0;
 }
 
 // Defense in depth: a batch worker that spawns + kills hundreds of child

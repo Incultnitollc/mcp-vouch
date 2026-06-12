@@ -12,6 +12,7 @@ function row(id: string, scannedAt: string | null) {
     slug: id,
     name: id,
     repo_url: null,
+    card_summary_json: null,
     server_versions: null,
     trust_scores: scannedAt ? [{ scanned_at: scannedAt }] : null,
   };

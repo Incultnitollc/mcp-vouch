@@ -8,6 +8,13 @@
 // (packages/cli/src/lib/install-resolver.ts). When the registry adds an
 // `install_json` column at ingest (v1.2), this file can be deleted and the
 // worker can read that column directly.
+//
+// Two surfaces resolve here:
+//   - npm packages (source_url → `npx -y <pkg>`), the original sandbox path.
+//   - remote HTTP endpoints (card_summary_json.remotes[] → an http ScanTarget),
+//     which need no local launch and unlock the MCP05/MCP06 active checks.
+
+import type { RemoteTransport, ScanTarget } from "../types/index.js";
 
 export interface InstallBlock {
   command: string;
@@ -82,4 +89,62 @@ export async function resolveInstall(
 /** Render a resolved InstallBlock as a single stdio command string for scanServer(). */
 export function blockToCommand(block: InstallBlock): string {
   return [block.command, ...block.args].join(" ");
+}
+
+// --- remote (HTTP) endpoints -------------------------------------------------
+
+/** One entry of a registry server's `card_summary_json.remotes[]`. */
+export interface RemoteEndpoint {
+  url: string;
+  /** "streamable-http" | "sse" (current spec) — anything else is ignored. */
+  type: string;
+}
+
+function isHttpUrl(url: string | null | undefined): url is string {
+  return typeof url === "string" && /^https?:\/\//i.test(url);
+}
+
+/**
+ * Pick a connectable remote endpoint from a server's `remotes[]`, preferring the
+ * current `streamable-http` transport over legacy `sse`. Returns null when the
+ * server declares no usable HTTP remote. We connect unauthenticated — auth-gated
+ * endpoints fail at handshake and the worker records that as skipped, not failed.
+ */
+export function pickRemote(
+  remotes: RemoteEndpoint[] | null | undefined,
+): Extract<ScanTarget, { kind: "http" }> | null {
+  if (!remotes || remotes.length === 0) return null;
+  const byType = (t: RemoteTransport) =>
+    remotes.find((r) => r.type === t && isHttpUrl(r.url));
+  const chosen = byType("streamable-http") ?? byType("sse");
+  if (!chosen) return null;
+  return {
+    kind: "http",
+    url: chosen.url,
+    transport: chosen.type as RemoteTransport,
+  };
+}
+
+/** Minimal view of a registry row needed to choose what to connect to. */
+export interface ResolvableServer {
+  source_url: string | null;
+  remotes?: RemoteEndpoint[] | null;
+}
+
+/**
+ * Choose the scan target for a registry server. A hosted remote endpoint is
+ * preferred over an npm package: it needs no local launch (no OOM/sandbox risk)
+ * and activates the auth + transport checks that stdio can only SKIP. Falls back
+ * to the npm `npx -y <pkg>` stdio command, or null when neither resolves.
+ */
+export async function resolveScanTarget(
+  server: ResolvableServer,
+  npmExists: NpmExists = npmRegistryExists,
+): Promise<ScanTarget | null> {
+  const remote = pickRemote(server.remotes);
+  if (remote) return remote;
+
+  const npm = await resolveInstall(server.source_url, npmExists);
+  if (npm.block) return { kind: "stdio", command: blockToCommand(npm.block) };
+  return null;
 }

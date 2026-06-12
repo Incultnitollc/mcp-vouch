@@ -51,3 +51,18 @@ export interface TrustReport {
 
 /** Maximum points any single check can award. */
 export const MAX_POINTS_PER_CHECK = 10;
+
+/** Remote (network) MCP transports the scanner can connect over. */
+export type RemoteTransport = "streamable-http" | "sse";
+
+/**
+ * What the scanner connects to. The registry yields one of two shapes:
+ *   - `stdio`: an npm package launched locally via `npx -y` (the sandbox path,
+ *     subject to the worker's memory watchdog + npm-cache cleanup).
+ *   - `http`: a hosted remote endpoint (`card_summary_json.remotes[]`). Nothing
+ *     is launched locally, so the HTTP path has no OOM/sandbox concern — and it
+ *     activates the auth (MCP05) and transport (MCP06) checks that stdio skips.
+ */
+export type ScanTarget =
+  | { kind: "stdio"; command: string; extraEnv?: Record<string, string> }
+  | { kind: "http"; url: string; transport: RemoteTransport };
