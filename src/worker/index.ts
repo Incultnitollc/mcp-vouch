@@ -11,6 +11,9 @@
 // are skipped (logged), not scored against — we never score what we couldn't
 // safely launch.
 
+import { rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { TrustScanner } from "../scanners/trust-scanner.js";
 import {
   blockToCommand,
@@ -62,6 +65,26 @@ interface ScanOutcome {
 function memMi(): string {
   const b = currentMemoryBytes();
   return b == null ? "?" : `${Math.round(b / 1024 / 1024)}Mi`;
+}
+
+/**
+ * Delete the npm/npx cache after each scan. THE actual OOM root cause: on Render
+ * `~/.npm` is RAM-backed (tmpfs), so every `npx -y <pkg>` writes the package +
+ * its dependency tree there and never removes it. Memory ratchets up install by
+ * install — never freed by killing processes ("reaped 0") because it's cached
+ * FILES, not process RSS — until it crosses 512Mi (the original OOM) or pins the
+ * watchdog above its threshold so every later server is skipped (scanned=0).
+ * Clearing these dirs between scans keeps memory flat at baseline + one install.
+ * `npm_config_cache` honored if set; else the default ~/.npm (HOME=/opt/render).
+ */
+async function cleanNpmCache(): Promise<void> {
+  const cacheRoot = process.env.npm_config_cache ?? join(homedir(), ".npm");
+  // _npx holds the installed package trees; _cacache holds downloaded tarballs.
+  await Promise.all(
+    ["_npx", "_cacache"].map((sub) =>
+      rm(join(cacheRoot, sub), { recursive: true, force: true }).catch(() => {}),
+    ),
+  );
 }
 
 function envInt(name: string, fallback: number): number {
@@ -181,6 +204,9 @@ async function scanOne(
     };
   } finally {
     watchdog.stop();
+    // Free this scan's install footprint from tmpfs so memory doesn't ratchet
+    // up across the run. This is the core OOM fix — see cleanNpmCache.
+    await cleanNpmCache();
   }
 }
 
