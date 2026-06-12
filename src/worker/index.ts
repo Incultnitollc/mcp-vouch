@@ -20,8 +20,10 @@ import {
 import {
   MemoryExceededError,
   MemoryWatchdog,
+  currentMemoryBytes,
   killSubtree,
   readContainerMemoryBytes,
+  treeRssBytes,
 } from "./memory-guard.js";
 import {
   getSupabase,
@@ -38,7 +40,7 @@ const DEFAULT_MAX_PER_RUN = 200;
 // Container memory watchdog (see memory-guard.ts). Default trip point sits well
 // below Render starter's 512Mi hard limit so we can abort + reap a runaway
 // `npx -y` install before the kernel OOM-kills the whole cron.
-const DEFAULT_MEM_LIMIT_MB = 400;
+const DEFAULT_MEM_LIMIT_MB = 360;
 const DEFAULT_MEM_POLL_MS = 200;
 
 interface RunCounters {
@@ -56,9 +58,9 @@ interface ScanOutcome {
   note?: string;
 }
 
-/** Current container memory as a compact "NMi" string, or "?" when unreadable. */
+/** Current memory signal as a compact "NMi" string, or "?" when unreadable. */
 function memMi(): string {
-  const b = readContainerMemoryBytes();
+  const b = currentMemoryBytes();
   return b == null ? "?" : `${Math.round(b / 1024 / 1024)}Mi`;
 }
 
@@ -215,13 +217,16 @@ export async function runWorker(): Promise<RunCounters> {
   const memLimitBytes = envInt("MCP_VOUCH_MEM_LIMIT_MB", DEFAULT_MEM_LIMIT_MB) * 1024 * 1024;
   const memPollMs = envInt("MCP_VOUCH_MEM_POLL_MS", DEFAULT_MEM_POLL_MS);
 
-  // Diagnostic: confirm the watchdog can actually read the container's cgroup
-  // memory in THIS environment. "unreadable" here means the guard is a no-op and
-  // we'd OOM for real — the single most important line to check after a crash.
-  const probe = readContainerMemoryBytes();
+  // Diagnostic: which memory signal(s) work in THIS container? The watchdog uses
+  // max(cgroup, tree-RSS), so it stays armed as long as AT LEAST ONE is non-null.
+  // "both null" would mean the guard is a no-op and we'd OOM for real.
+  const cg = readContainerMemoryBytes();
+  const rss = treeRssBytes(process.pid);
+  const fmt = (b: number | null) => (b == null ? "null" : `${Math.round(b / 1024 / 1024)}Mi`);
   // eslint-disable-next-line no-console
   console.log(
-    `mcp-vouch worker: cgroup mem probe = ${probe == null ? "UNREADABLE (watchdog disabled!)" : `${Math.round(probe / 1024 / 1024)}Mi readable`}`,
+    `mcp-vouch worker: mem signals — cgroup=${fmt(cg)} treeRSS=${fmt(rss)}` +
+      (cg == null && rss == null ? " — BOTH NULL, WATCHDOG DISABLED!" : " — watchdog armed"),
   );
 
   const client = getSupabase();

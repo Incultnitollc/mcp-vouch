@@ -8,6 +8,7 @@ import {
   descendantPids,
   parseCgroupMemoryBytes,
   parseProcStat,
+  parseStatmResidentBytes,
   readContainerMemoryBytes,
 } from "../src/worker/memory-guard.js";
 
@@ -77,20 +78,31 @@ describe("descendantPids", () => {
   });
 });
 
+describe("parseStatmResidentBytes", () => {
+  it("returns resident pages × page size (field 2)", () => {
+    // statm: size resident shared text lib data dt — resident=100 pages × 4096.
+    expect(parseStatmResidentBytes("2000 100 50 1 0 300 0")).toBe(100 * 4096);
+  });
+
+  it("returns null for an unparseable body", () => {
+    expect(parseStatmResidentBytes("")).toBeNull();
+  });
+});
+
 describe("MemoryWatchdog", () => {
-  it("fires onExceed once when usage crosses the limit", () => {
+  it("fires onExceed once when the sampled value crosses the limit", () => {
     vi.useFakeTimers();
     try {
-      let used = 100;
-      const read = () => `${used * 1024 * 1024}`;
-      const wd = new MemoryWatchdog(400 * 1024 * 1024, 200, read);
+      let used = 100 * 1024 * 1024;
+      const sample = () => used;
+      const wd = new MemoryWatchdog(400 * 1024 * 1024, 200, sample);
       const onExceed = vi.fn();
       wd.start(onExceed);
 
       vi.advanceTimersByTime(200); // 100Mi — under
       expect(onExceed).not.toHaveBeenCalled();
 
-      used = 450; // now over the 400Mi limit
+      used = 450 * 1024 * 1024; // now over the 400Mi limit
       vi.advanceTimersByTime(200);
       vi.advanceTimersByTime(200); // would fire again, but it stopped after first
       expect(onExceed).toHaveBeenCalledTimes(1);
@@ -99,7 +111,7 @@ describe("MemoryWatchdog", () => {
     }
   });
 
-  it("never fires when cgroup accounting is unavailable", () => {
+  it("never fires when no memory signal is available (sampler returns null)", () => {
     vi.useFakeTimers();
     try {
       const wd = new MemoryWatchdog(1, 100, () => null);

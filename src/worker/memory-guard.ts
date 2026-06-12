@@ -55,13 +55,69 @@ export function parseCgroupMemoryBytes(raw: string | null): number | null {
 }
 
 /**
- * Current memory used by this container in bytes, or null when no cgroup
- * accounting is readable (non-Linux dev box, missing files). cgroup v2 first.
+ * cgroup-reported memory for this container in bytes, or null when no cgroup
+ * accounting is readable (non-Linux dev box, missing files, or — observed on
+ * Render — a container whose cgroup files aren't exposed at the expected path).
+ * cgroup v2 first, v1 fallback. This is ONE of two signals the watchdog uses.
  */
 export function readContainerMemoryBytes(read: FileReader = defaultReader): number | null {
   const v2 = parseCgroupMemoryBytes(read(CGROUP_V2));
   if (v2 != null) return v2;
   return parseCgroupMemoryBytes(read(CGROUP_V1));
+}
+
+// Linux page size. getconf PAGESIZE is 4096 on every arch Render runs (x86_64,
+// arm64); Node has no portable getpagesize(), so we assume it.
+const PAGE_SIZE = 4096;
+
+/**
+ * Resident set size from a /proc/<pid>/statm body, in bytes. statm fields are
+ * "size resident shared ..." in pages — field 2 (resident) is the one that
+ * counts toward the cgroup/OOM budget for anonymous memory.
+ */
+export function parseStatmResidentBytes(content: string): number | null {
+  const fields = content.trim().split(/\s+/);
+  const resident = Number.parseInt(fields[1] ?? "", 10);
+  return Number.isFinite(resident) ? resident * PAGE_SIZE : null;
+}
+
+function procResidentBytes(pid: number): number | null {
+  try {
+    return parseStatmResidentBytes(readFileSync(`/proc/${pid}/statm`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Summed RSS of the worker process tree (rootPid + every descendant) in bytes,
+ * or null when /proc is absent (non-Linux). This is the cgroup-independent
+ * fallback signal: it needs nothing but /proc and so works in containers where
+ * the cgroup memory files aren't readable. It slightly UNDER-counts vs cgroup
+ * (no page cache), which is fine — anonymous RSS is what actually drives OOM
+ * kills, and we run the threshold with headroom anyway.
+ */
+export function treeRssBytes(rootPid: number): number | null {
+  const root = procResidentBytes(rootPid);
+  if (root == null) return null; // no /proc → signal unavailable
+  let total = root;
+  for (const pid of descendantPids(rootPid)) {
+    total += procResidentBytes(pid) ?? 0;
+  }
+  return total;
+}
+
+/**
+ * The watchdog's memory signal: the MAX of the cgroup reading and the process
+ * tree's summed RSS. Using max means a failure of EITHER source can't blind the
+ * guard — if cgroup is unreadable we still see tree RSS, and vice versa. Returns
+ * null only when both are unavailable (non-Linux dev box → guard is a no-op).
+ */
+export function currentMemoryBytes(rootPid: number = process.pid): number | null {
+  const cg = readContainerMemoryBytes();
+  const rss = treeRssBytes(rootPid);
+  if (cg == null && rss == null) return null;
+  return Math.max(cg ?? 0, rss ?? 0);
 }
 
 interface ProcEntry {
@@ -148,9 +204,11 @@ export function killSubtree(rootPid: number): number {
 }
 
 /**
- * Poll container memory every `pollMs`. The first sample at or above
+ * Poll the memory signal every `pollMs`. The first sample at or above
  * `limitBytes` invokes `onExceed` once and stops polling. No-op (never fires)
- * when cgroup accounting is unreadable. Call stop() to clear the timer.
+ * when the sampler returns null on every tick (non-Linux: no cgroup AND no
+ * /proc). `sample` is injectable for tests; defaults to currentMemoryBytes
+ * (max of cgroup reading and process-tree RSS). Call stop() to clear the timer.
  */
 export class MemoryWatchdog {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -159,13 +217,13 @@ export class MemoryWatchdog {
   constructor(
     private readonly limitBytes: number,
     private readonly pollMs: number,
-    private readonly read: FileReader = defaultReader,
+    private readonly sample: () => number | null = () => currentMemoryBytes(),
   ) {}
 
   start(onExceed: (used: number) => void): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      const used = readContainerMemoryBytes(this.read);
+      const used = this.sample();
       if (used != null && used >= this.limitBytes && !this.fired) {
         this.fired = true;
         this.stop();

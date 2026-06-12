@@ -53,7 +53,7 @@ services:
       - key: NODE_OPTIONS
         value: "--max-old-space-size=256" # keep parent heap small so installs get max headroom
       - key: MCP_VOUCH_MEM_LIMIT_MB
-        value: "400"                      # watchdog trip point, < 512Mi container limit
+        value: "360"                      # watchdog trip point; margin below 512Mi (tree-RSS undercounts)
       - key: MCP_VOUCH_MEM_POLL_MS
         value: "200"
       - key: MCP_VOUCH_SCAN_TIMEOUT_MS
