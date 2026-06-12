@@ -17,7 +17,12 @@ import {
   resolveInstall,
   type ResolveResult,
 } from "./install-resolver.js";
-import { MemoryExceededError, MemoryWatchdog, killSubtree } from "./memory-guard.js";
+import {
+  MemoryExceededError,
+  MemoryWatchdog,
+  killSubtree,
+  readContainerMemoryBytes,
+} from "./memory-guard.js";
 import {
   getSupabase,
   listActiveServers,
@@ -49,6 +54,12 @@ interface ScanOutcome {
   server: RegistryServerRow;
   result: "scanned" | "skipped_unresolved" | "skipped_oversized" | "failed" | "timed_out";
   note?: string;
+}
+
+/** Current container memory as a compact "NMi" string, or "?" when unreadable. */
+function memMi(): string {
+  const b = readContainerMemoryBytes();
+  return b == null ? "?" : `${Math.round(b / 1024 / 1024)}Mi`;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -188,7 +199,7 @@ async function drain(
       const tag = outcome.result.toUpperCase();
       const note = outcome.note ? ` — ${outcome.note}` : "";
       // eslint-disable-next-line no-console
-      console.log(`[${i + 1}/${queue.length}] ${tag} ${server.slug}${note}`);
+      console.log(`[${i + 1}/${queue.length}] mem=${memMi()} ${tag} ${server.slug}${note}`);
     }
   }
 
@@ -203,6 +214,15 @@ export async function runWorker(): Promise<RunCounters> {
   const maxPerRun = envInt("MCP_VOUCH_MAX_PER_RUN", DEFAULT_MAX_PER_RUN);
   const memLimitBytes = envInt("MCP_VOUCH_MEM_LIMIT_MB", DEFAULT_MEM_LIMIT_MB) * 1024 * 1024;
   const memPollMs = envInt("MCP_VOUCH_MEM_POLL_MS", DEFAULT_MEM_POLL_MS);
+
+  // Diagnostic: confirm the watchdog can actually read the container's cgroup
+  // memory in THIS environment. "unreadable" here means the guard is a no-op and
+  // we'd OOM for real — the single most important line to check after a crash.
+  const probe = readContainerMemoryBytes();
+  // eslint-disable-next-line no-console
+  console.log(
+    `mcp-vouch worker: cgroup mem probe = ${probe == null ? "UNREADABLE (watchdog disabled!)" : `${Math.round(probe / 1024 / 1024)}Mi readable`}`,
+  );
 
   const client = getSupabase();
   const servers = await listActiveServers(client, maxPerRun);
