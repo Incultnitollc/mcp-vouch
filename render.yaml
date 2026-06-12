@@ -36,17 +36,26 @@ services:
         sync: false                       # set in Render dashboard
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false                       # set in Render dashboard — never commit
-      # OOM root cause (2026-06-03 verification): orphan-child dispose fix
-      # shipped (4d34fc9) but didn't solve OOM. Both post-fix runs (12:00 +
-      # 18:00 UTC 6/3) still OOM'd at ~server #23, identical signature.
-      # Real culprit: concurrent `npx -y <pkg>` installs of native-binary
-      # packages (node-gyp / prebuild-install) blow 512Mi regardless of
-      # orphan cleanup. Drop to serial. If 1 still OOMs the parent worker
-      # alone is over budget → upgrade Render plan starter → standard 2Gi.
+      # OOM root cause (confirmed 2026-06-11 logs): a single `npx -y <pkg>`
+      # install pulls the server's full transitive npm tree — native binaries
+      # (prebuild-install / node-gyp) + large deps (e.g. posthog-node) — and
+      # extraction spikes RSS past 512Mi even at concurrency=1. The bomb is
+      # often a TRANSITIVE dep, so a top-level build-script denylist misses it.
+      #
+      # Fix (2026-06-12): container memory watchdog (src/worker/memory-guard.ts)
+      # polls the cgroup memory.current every 200ms; at MCP_VOUCH_MEM_LIMIT_MB
+      # it aborts the running scan and SIGKILLs its npx→npm→node-gyp subtree,
+      # marking the server skipped_oversized. The container never reaches the
+      # 512Mi kernel ceiling. Stays free; if coverage of heavy packages matters
+      # later, upgrade plan starter → standard 2Gi and raise the limit.
       - key: MCP_VOUCH_CONCURRENCY
-        value: "1"
+        value: "1"                        # serial — killSubtree assumes 1 in-flight scan
       - key: NODE_OPTIONS
-        value: "--max-old-space-size=400"
+        value: "--max-old-space-size=256" # keep parent heap small so installs get max headroom
+      - key: MCP_VOUCH_MEM_LIMIT_MB
+        value: "400"                      # watchdog trip point, < 512Mi container limit
+      - key: MCP_VOUCH_MEM_POLL_MS
+        value: "200"
       - key: MCP_VOUCH_SCAN_TIMEOUT_MS
         value: "60000"
       - key: MCP_VOUCH_MAX_PER_RUN
