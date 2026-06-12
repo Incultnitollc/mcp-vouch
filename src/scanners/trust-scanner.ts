@@ -51,6 +51,7 @@ const SHADOW_TARGETS = new Set([
 
 export class TrustScanner {
   private readonly command: string;
+  private readonly extraEnv: Record<string, string>;
   private client: Client | null = null;
   private serverInfo: ServerInfo = {
     name: "unknown",
@@ -58,9 +59,17 @@ export class TrustScanner {
     protocolVersion: "unknown",
   };
 
-  /** @param command e.g. "npx -y @modelcontextprotocol/server-everything" */
-  constructor(command: string) {
+  /**
+   * @param command e.g. "npx -y @modelcontextprotocol/server-everything"
+   * @param extraEnv extra env vars merged into the spawned child on top of the
+   *   SDK's safe-inherit defaults. The worker passes NPM_CONFIG_IGNORE_SCRIPTS
+   *   here so `npx -y` never runs native build scripts (the OOM source). Must be
+   *   passed via the transport because the SDK spawns with a sanitized env
+   *   safelist, not the parent's full environment.
+   */
+  constructor(command: string, extraEnv: Record<string, string> = {}) {
     this.command = command.trim();
+    this.extraEnv = extraEnv;
   }
 
   /** Connect, run all 10 checks, disconnect, and return the report. */
@@ -103,7 +112,14 @@ export class TrustScanner {
     }
     const [cmd, ...args] = parts;
 
-    const transport = new StdioClientTransport({ command: cmd, args });
+    // The SDK merges this `env` with its safe-inherit defaults (HOME/PATH/…),
+    // so extraEnv (e.g. NPM_CONFIG_IGNORE_SCRIPTS) reaches the `npx` child even
+    // though the parent's full environment is intentionally not forwarded.
+    const transport = new StdioClientTransport({
+      command: cmd,
+      args,
+      ...(Object.keys(this.extraEnv).length > 0 ? { env: this.extraEnv } : {}),
+    });
 
     // The SDK reports the negotiated protocol version by calling the transport's
     // optional `setProtocolVersion` hook during initialize. stdio doesn't store

@@ -119,7 +119,12 @@ async function scanOne(
   // we keep a reference and can dispose() it on timeout/error — otherwise the
   // spawned `npx -y <pkg>` child outlives the scan promise and holds RSS until
   // the cron container exits. See issue #1.
-  const scanner = new TrustScanner(command);
+  // NPM_CONFIG_IGNORE_SCRIPTS disables npm lifecycle scripts (install/postinstall)
+  // for the `npx -y` install tree-wide — this is the PRIMARY OOM fix: it stops
+  // native build tooling (prebuild-install/node-gyp) from running, which is the
+  // memory spike that overruns 512Mi faster than the watchdog can poll. Passed
+  // via the child env because the SDK doesn't forward the parent environment.
+  const scanner = new TrustScanner(command, { NPM_CONFIG_IGNORE_SCRIPTS: "true" });
   // Watchdog races the scan: if the container's memory crosses the guard
   // threshold (almost always during this server's `npx -y` install), reject so
   // we abort + reap before the kernel OOM-kills the whole cron.

@@ -48,14 +48,12 @@ services:
       # marking the server skipped_oversized. The container never reaches the
       # 512Mi kernel ceiling. Stays free; if coverage of heavy packages matters
       # later, upgrade plan starter → standard 2Gi and raise the limit.
-      # PRIMARY OOM fix: never run npm lifecycle scripts during `npx -y <pkg>`.
-      # The 512Mi bomb was native build tooling (prebuild-install / node-gyp)
-      # invoked by install/postinstall scripts — often in a TRANSITIVE dep.
-      # ignore-scripts disables them tree-wide, killing the spike at the source
-      # (also a security win: we never execute arbitrary install scripts). The
-      # cgroup/tree-RSS watchdog stays as a backstop for pure-JS mega-trees.
-      - key: NPM_CONFIG_IGNORE_SCRIPTS
-        value: "true"
+      # PRIMARY OOM fix: NPM_CONFIG_IGNORE_SCRIPTS is injected into the scanned
+      # server's `npx -y` child env by TrustScanner (NOT set here — a global env
+      # var would hit the worker's own `npm ci` build AND wouldn't reach the
+      # child, since the MCP SDK spawns it with a sanitized env safelist). It
+      # disables npm lifecycle scripts (prebuild-install / node-gyp) tree-wide,
+      # killing the native-build memory spike at the source. Watchdog = backstop.
       - key: MCP_VOUCH_CONCURRENCY
         value: "1"                        # serial — killSubtree assumes 1 in-flight scan
       - key: NODE_OPTIONS
