@@ -14,6 +14,8 @@
 import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { argv } from "node:process";
+import { pathToFileURL } from "node:url";
 import { TrustScanner } from "../scanners/trust-scanner.js";
 import {
   blockToCommand,
@@ -286,6 +288,24 @@ export async function runWorker(): Promise<RunCounters> {
   return counters;
 }
 
+/**
+ * Process exit code from a run's counters.
+ *
+ * A slice that's entirely non-npm (every server skipped_unresolved) is NOT a
+ * failure — the scanner simply has nothing it can launch this run, which is
+ * normal because most of the registry is non-npm and the batch rotates. The old
+ * rule (`total > 0 && scanned === 0 -> 2`) reddened those runs and trained the
+ * team to ignore the cron's status (alert fatigue).
+ *
+ * Red (exit 2) only when servers we COULD resolve all failed to produce a score
+ * — i.e. resolvable > 0 and scanned === 0. That's a real regression worth an
+ * alert; everything else is green.
+ */
+export function exitCodeForRun(c: RunCounters): 0 | 2 {
+  const resolvable = c.total - c.skipped_unresolved;
+  return resolvable > 0 && c.scanned === 0 ? 2 : 0;
+}
+
 // Defense in depth: a batch worker that spawns + kills hundreds of child
 // processes will occasionally produce a late rejection from an aborted scan's
 // transport after we've already moved on. Node 22 treats an unhandledRejection
@@ -296,18 +316,20 @@ process.on("unhandledRejection", (reason) => {
   console.error("mcp-vouch worker: swallowed unhandledRejection:", reason);
 });
 
-// Render cron entrypoint.
-runWorker().then(
-  (c) => {
-    // Non-zero exit when nothing scanned AND there are servers to scan, so the
-    // cron shows red in Render. A clean run with skipped/failed > 0 but
-    // scanned > 0 is still "green" — partial coverage is normal.
-    if (c.total > 0 && c.scanned === 0) process.exit(2);
-    process.exit(0);
-  },
-  (err) => {
-    // eslint-disable-next-line no-console
-    console.error("mcp-vouch worker fatal:", err);
-    process.exit(1);
-  },
-);
+// Render cron entrypoint. Guard so importing this module (e.g. from tests, to
+// reach exitCodeForRun) doesn't kick off a real worker run + process.exit.
+const isDirectRun = argv[1] != null && import.meta.url === pathToFileURL(argv[1]).href;
+if (isDirectRun) {
+  runWorker().then(
+    (c) => {
+      // Red only when servers we could resolve all failed to score (see
+      // exitCodeForRun). An all-non-npm slice exits 0 — nothing to scan ≠ failure.
+      process.exit(exitCodeForRun(c));
+    },
+    (err) => {
+      // eslint-disable-next-line no-console
+      console.error("mcp-vouch worker fatal:", err);
+      process.exit(1);
+    },
+  );
+}
