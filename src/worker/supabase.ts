@@ -44,6 +44,53 @@ function lastScannedAt(row: ServerWithVersionsRow): number {
   return ts ? Date.parse(ts) : 0;
 }
 
+// How often the unscanned-batch window rotates. With a 6h cron each run lands
+// on a different window; manual one-off runs >this-apart also differ. Keeping it
+// well under the cron interval guarantees consecutive runs never repeat a batch.
+const ROTATE_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Order the registry into this run's scan queue.
+ *
+ * The bug this fixes: unscanned servers keep scanned_at=0 forever when they're
+ * skipped/failed (no trust_scores row is written), so a plain "unscanned first,
+ * oldest next" sort returns the SAME top-N every run. If a memory-bomb server
+ * sits in that fixed window, every run hits it, dies, and writes nothing new —
+ * the worker is pinned at a handful of scores indefinitely (observed: stuck at
+ * 17 for weeks). More RAM wouldn't help; the run keeps retrying one poison set.
+ *
+ * Fix: split scored vs unscanned. Scored rows still go oldest-first (re-scan
+ * rotation). The unscanned block — the bulk — is rotated by a time-derived
+ * offset so each run takes a FRESH window. A poison server now costs at most one
+ * run per full pass instead of stalling every run, and coverage marches through
+ * the whole registry. Pure function (now injected) so it's unit-testable.
+ */
+export function orderForRun(
+  raw: ServerWithVersionsRow[],
+  maxPerRun: number,
+  nowMs: number,
+): ServerWithVersionsRow[] {
+  const unscanned: ServerWithVersionsRow[] = [];
+  const scored: ServerWithVersionsRow[] = [];
+  for (const row of raw) {
+    if (lastScannedAt(row) === 0) unscanned.push(row);
+    else scored.push(row);
+  }
+  // Stable input order (servers fetched by created_at asc) makes the rotation
+  // deterministic across runs.
+  if (unscanned.length > maxPerRun) {
+    const batches = Math.ceil(unscanned.length / maxPerRun);
+    const batchIndex = Math.floor(nowMs / ROTATE_MS) % batches;
+    const offset = batchIndex * maxPerRun;
+    const rotated = [...unscanned.slice(offset), ...unscanned.slice(0, offset)];
+    unscanned.length = 0;
+    unscanned.push(...rotated);
+  }
+  // Re-scan the least-recently-scored servers only after unscanned coverage.
+  scored.sort((a, b) => lastScannedAt(a) - lastScannedAt(b));
+  return [...unscanned, ...scored];
+}
+
 export interface TrustScoreUpsert {
   server_id: string;
   total_score: number;
@@ -103,12 +150,11 @@ export async function listActiveServers(
     from += pageSize;
   }
 
-  // Unscanned (scanned_at = 0) first, then oldest scan first. Cron runs every
-  // 6h with maxPerRun rows, so each row gets re-scanned roughly every
-  // (rows / (maxPerRun * 4)) days.
-  raw.sort((a, b) => lastScannedAt(a) - lastScannedAt(b));
+  // Rotate the unscanned window each run so a memory-bomb server can't pin the
+  // worker on one doomed batch forever (see orderForRun).
+  const ordered = orderForRun(raw, maxPerRun, Date.now());
 
-  return raw.slice(0, maxPerRun).map((row) => ({
+  return ordered.slice(0, maxPerRun).map((row) => ({
     id: row.id,
     slug: row.slug,
     name: row.name,
