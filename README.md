@@ -1,5 +1,8 @@
 # MCP Vouch
 
+> **⚠️ This repo has moved.** `mcp-vouch` is now part of the MCP Registry monorepo: **[Incultnitollc/mcp-registry](https://github.com/Incultnitollc/mcp-registry)**.
+> Use the new CLI: `npm i -g @incultnitollc/mcpr && mcpr scan <cmd|url>`. This repo is archived and read-only.
+
 Trust scoring and security layer for MCP servers.
 
 Scans an MCP server against the OWASP MCP Top 10 and returns a **0–100 trust score** plus an **A–F grade**. The badge on the [MCP Registry](https://github.com/Incultnitollc/mcp-registry) listing is the product; the CLI is free and open.
